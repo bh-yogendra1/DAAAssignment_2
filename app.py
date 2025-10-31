@@ -1,136 +1,222 @@
 import streamlit as st
 import pandas as pd
-import io
 import logging
 from datetime import datetime
 
-# -------------------------
-# Logger setup
-# -------------------------
-logger = logging.getLogger("allocation_app")
-logger.setLevel(logging.DEBUG)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Add handlers only once (avoid duplicates when Streamlit re-runs)
-if not logger.handlers:
-    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    fh = logging.FileHandler("allocation_app.log")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
-
-# -------------------------
-# Helper functions
-# -------------------------
-def find_cgpa_col(cols):
-    """Return index of first column containing 'cgpa' (case-insensitive), or None."""
-    for i, c in enumerate(cols):
-        if "cgpa" in str(c).lower():
-            return i
-    return None
-
-def allocate_students(df):
-    """
-    df: input dataframe
-    Returns: allocation_df, fac_count_df
-    """
+def count_faculty_columns(df, cgpa_col='CGPA'):
+    """Dynamically count faculty columns after CGPA"""
     try:
-        cols = list(df.columns)
-        cgpa_idx = find_cgpa_col(cols)
-        if cgpa_idx is None:
-            raise ValueError("No column with name containing 'cgpa' found. Please ensure your CSV has a CGPA column.")
-
-        pref_cols = cols[cgpa_idx + 1 :]
-        if len(pref_cols) == 0:
-            raise ValueError("No preference columns found after the CGPA column. At least one preference column is required.")
-
-        n = len(pref_cols)
-        logger.info(f"Detected CGPA column at index {cgpa_idx} ('{cols[cgpa_idx]}'), preference columns: {pref_cols}, n={n}")
-
-        # Ensure cgpa numeric
-        cgpa_col = cols[cgpa_idx]
-        df[cgpa_col] = pd.to_numeric(df[cgpa_col], errors="coerce")
-        if df[cgpa_col].isna().any():
-            logger.warning("Some CGPA values could not be converted to numeric (NaN). These rows will be sorted with NaN at the end.")
-
-        # Sort descending CGPA (highest first), tie-breaker: keep original order
-        df_sorted = df.sort_values(by=cgpa_col, ascending=False).reset_index(drop=True)
-
-        assigned = []
-        for idx, row in df_sorted.iterrows():
-            pref_col = pref_cols[idx % n]   # pick preference column in round-robin
-            assigned_fac = row[pref_col]
-            assigned.append(assigned_fac)
-
-        df_sorted["AssignedFaculty"] = assigned
-
-        # Output file 1: allocation
-        allocation_df = df_sorted.copy()
-
-        # Output file 2: faculty preference counts
-        fac_count = allocation_df["AssignedFaculty"].value_counts(dropna=False).reset_index()
-        fac_count.columns = ["Faculty", "AllocatedCount"]
-
-        return allocation_df, fac_count
-
+        idx = df.columns.get_loc(cgpa_col)
+        faculty_cols = df.columns[idx + 1:].tolist()
+        logger.info(f"Found {len(faculty_cols)} faculty columns: {faculty_cols}")
+        return faculty_cols
     except Exception as e:
-        logger.exception("Error during allocation")
+        logger.error(f"Error counting faculty columns: {str(e)}")
         raise
 
-# -------------------------
+def allocate_students(df, cgpa_col='CGPA'):
+    """
+    Allocate students to faculties using mod n algorithm:
+    1. Sort students by CGPA (descending)
+    2. Use mod n to determine which faculty column to allocate
+    3. In each cycle of n students, each faculty gets exactly one student
+    """
+    try:
+        # Sort by CGPA descending
+        df_sorted = df.sort_values(by=cgpa_col, ascending=False).reset_index(drop=True)
+        logger.info(f"Sorted {len(df_sorted)} students by CGPA (descending)")
+
+        # Get faculty columns dynamically
+        faculty_cols = count_faculty_columns(df_sorted, cgpa_col)
+        n_faculties = len(faculty_cols)
+
+        allocations = []
+
+        # Allocate: i-th student (after sorting) gets faculty at position (i mod n)
+        for i in range(len(df_sorted)):
+            row = df_sorted.iloc[i]
+
+            # Faculty column index based on mod n
+            fac_index = i % n_faculties
+            allocated_faculty = faculty_cols[fac_index]
+
+            allocations.append({
+                'Roll': row['Roll'],
+                'Name': row['Name'],
+                'Email': row['Email'],
+                'CGPA': row['CGPA'],
+                'Allocated': allocated_faculty
+            })
+
+        alloc_df = pd.DataFrame(allocations)
+        logger.info(f"Successfully allocated {len(alloc_df)} students")
+        return alloc_df
+
+    except Exception as e:
+        logger.error(f"Error in allocation: {str(e)}")
+        raise
+
+def compute_faculty_preference_stats(df, cgpa_col='CGPA'):
+    """
+    Compute statistics of how many times each faculty was selected at each preference level (1-n)
+    """
+    try:
+        faculty_cols = count_faculty_columns(df, cgpa_col)
+        n_faculties = len(faculty_cols)
+
+        # Initialize statistics dictionary
+        pref_stats = {}
+        for fac in faculty_cols:
+            pref_stats[fac] = {i: 0 for i in range(1, n_faculties + 1)}
+
+        # Count preferences
+        for _, row in df.iterrows():
+            for fac in faculty_cols:
+                try:
+                    pref_value = int(row[fac])
+                    if 1 <= pref_value <= n_faculties:
+                        pref_stats[fac][pref_value] += 1
+                except Exception as e:
+                    logger.warning(f"Invalid preference value for faculty {fac}: {row[fac]}")
+
+        # Create DataFrame
+        pref_df = pd.DataFrame(pref_stats)
+        pref_df.columns = [f'Count Pref {i}' for i in range(1, n_faculties + 1)]
+        pref_df.index.name = 'Fac'
+        pref_df = pref_df.reset_index()
+
+        logger.info("Successfully computed faculty preference statistics")
+        return pref_df
+
+    except Exception as e:
+        logger.error(f"Error computing preference stats: {str(e)}")
+        raise
+
 # Streamlit UI
-# -------------------------
-st.set_page_config(page_title="MTP Allocation", layout="wide")
-st.title("MTP Allocation Tool")
+st.set_page_config(page_title="BTP/MTP Faculty Allocation", layout="wide")
 
+st.title("🎓 BTP/MTP Faculty Allocation System")
+st.markdown("""
+This application allocates students to faculties based on:
+- **Dynamic faculty detection** (columns after CGPA)
+- **CGPA-based sorting** (descending order)
+- **Mod n allocation algorithm** (round-robin distribution)
+""")
 
+st.divider()
 
-uploaded_file = st.file_uploader("Upload input CSV", type=["csv"])
+# File upload
+uploaded_file = st.file_uploader(
+    "Upload Student Preferences CSV",
+    type=['csv'],
+    help="CSV file with columns: Roll, Name, Email, CGPA, followed by faculty preference columns"
+)
 
 if uploaded_file is not None:
     try:
-        df = pd.read_csv(uploaded_file)
-        st.write("Preview of uploaded data (first 10 rows):")
-        st.dataframe(df.head(10))
+        # Read the input file
+        input_df = pd.read_csv(uploaded_file)
+        logger.info(f"File uploaded: {uploaded_file.name}, Shape: {input_df.shape}")
 
-        # Try to run allocation
-        st.info("Running allocation...")
-        allocation_df, fac_count_df = allocate_students(df)
+        st.success(f"✅ File uploaded successfully! ({len(input_df)} students)")
 
-        st.success("Allocation completed successfully.")
+        # Display input data preview
+        with st.expander("📊 View Input Data (First 10 rows)"):
+            st.dataframe(input_df.head(10))
 
-        st.subheader("Allocation Preview")
-        st.dataframe(allocation_df.head(20))
+        # Process button
+        if st.button("🚀 Process Allocation", type="primary"):
+            with st.spinner("Processing allocation..."):
+                try:
+                    # Perform allocation
+                    allocation_df = allocate_students(input_df)
+                    pref_stats_df = compute_faculty_preference_stats(input_df)
 
-        st.subheader("Faculty Allocation Counts")
-        st.dataframe(fac_count_df)
+                    st.success("✅ Allocation completed successfully!")
 
-        # Prepare CSVs for download
-        allocation_csv = allocation_df.to_csv(index=False).encode("utf-8")
-        fac_count_csv = fac_count_df.to_csv(index=False).encode("utf-8")
+                    # Display results
+                    col1, col2 = st.columns(2)
 
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        allocation_filename = f"output_btp_mtp_allocation_{now}.csv"
-        fac_count_filename = f"fac_preference_count_{now}.csv"
+                    with col1:
+                        st.subheader("📋 Allocation Results")
+                        st.dataframe(allocation_df, height=400)
 
-        st.download_button(
-            label="Download allocation CSV",
-            data=allocation_csv,
-            file_name=allocation_filename,
-            mime="text/csv",
-        )
-        st.download_button(
-            label="Download faculty counts CSV",
-            data=fac_count_csv,
-            file_name=fac_count_filename,
-            mime="text/csv",
-        )
+                        # Download allocation
+                        csv1 = allocation_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="⬇️ Download Allocation CSV",
+                            data=csv1,
+                            file_name="output_btp_mtp_allocation.csv",
+                            mime="text/csv",
+                            key="download_allocation"
+                        )
+
+                    with col2:
+                        st.subheader("📊 Faculty Preference Statistics")
+                        st.dataframe(pref_stats_df, height=400)
+
+                        # Download stats
+                        csv2 = pref_stats_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="⬇️ Download Statistics CSV",
+                            data=csv2,
+                            file_name="fac_preference_count.csv",
+                            mime="text/csv",
+                            key="download_stats"
+                        )
+
+                    # Summary statistics
+                    st.divider()
+                    st.subheader("📈 Summary Statistics")
+
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("Total Students", len(allocation_df))
+                    with col_b:
+                        st.metric("Total Faculties", len(count_faculty_columns(input_df)))
+                    with col_c:
+                        st.metric("Avg CGPA", f"{allocation_df['CGPA'].mean():.2f}")
+
+                    # Faculty allocation distribution
+                    st.subheader("🎯 Faculty Allocation Distribution")
+                    fac_dist = allocation_df['Allocated'].value_counts().reset_index()
+                    fac_dist.columns = ['Faculty', 'Student Count']
+                    st.bar_chart(fac_dist.set_index('Faculty'))
+
+                except Exception as e:
+                    st.error(f"❌ Error during processing: {str(e)}")
+                    logger.error(f"Processing error: {str(e)}", exc_info=True)
 
     except Exception as e:
-        logger.exception("Processing error")
-        st.error(f"Error: {e}. See logs for details (allocation_app.log).")
+        st.error(f"❌ Error reading file: {str(e)}")
+        logger.error(f"File reading error: {str(e)}", exc_info=True)
+
 else:
-    st.info("Please upload an input CSV to start allocation.")
+    st.info("👆 Please upload a CSV file to begin")
+
+    st.markdown("""
+    ### Expected File Format:
+    - **Columns**: `Roll`, `Name`, `Email`, `CGPA`, followed by faculty preference columns
+    - **Faculty columns**: Each column represents a faculty (e.g., ABM, AE, AM, ...)
+    - **Values**: Preference rankings (1 = top choice, higher numbers = lower preference)
+
+    ### Allocation Algorithm:
+    1. Students are sorted by CGPA in descending order
+    2. Faculties are assigned in round-robin fashion (mod n)
+    3. In each cycle of n students, each faculty gets exactly one student
+    """)
+
+# Footer
+st.divider()
+st.markdown("Built with ❤️ using Streamlit | Logs available in `app.log`")
